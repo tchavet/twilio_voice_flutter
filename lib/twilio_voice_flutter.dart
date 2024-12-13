@@ -128,7 +128,7 @@ class TwilioVoiceFlutter {
     Map<String, dynamic> data = const <String, dynamic>{},
   }) async {
     final args = <String, Object>{
-      "to": to,
+      "to": to.trim().replaceAll(" ", ""),
       "data": data,
     };
 

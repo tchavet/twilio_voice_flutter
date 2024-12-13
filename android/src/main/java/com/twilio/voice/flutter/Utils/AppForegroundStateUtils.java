@@ -2,7 +2,6 @@ package com.twilio.voice.flutter.Utils;
 
 public class AppForegroundStateUtils {
 
-
     private static AppForegroundStateUtils instance;
     private Boolean foreground = false;
 
@@ -17,7 +16,6 @@ public class AppForegroundStateUtils {
 
         return instance;
     }
-
 
     public void setForeground(Boolean foreground) {
         this.foreground = foreground;

@@ -3,7 +3,7 @@ import '../model/status.dart';
 import '../twilio_voice_flutter.dart';
 
 class TwilioVoiceFlutterCall extends Equatable {
-  /// Unique identifier for the call
+  /// The call sid is null until the call is in RINGING state.
   final String id;
 
   /// Display name of the caller

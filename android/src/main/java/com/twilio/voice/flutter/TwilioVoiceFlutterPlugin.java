@@ -1,49 +1,15 @@
-//package com.twilio.voice.flutter;
-//
-//import androidx.annotation.NonNull;
-//
-//import io.flutter.embedding.engine.plugins.FlutterPlugin;
-//import io.flutter.plugin.common.MethodCall;
-//import io.flutter.plugin.common.MethodChannel;
-//import io.flutter.plugin.common.MethodChannel.MethodCallHandler;
-//import io.flutter.plugin.common.MethodChannel.Result;
-//
-///** TwilioVoiceFlutterPlugin */
-//public class TwilioVoiceFlutterPlugin implements FlutterPlugin, MethodCallHandler {
-//  /// The MethodChannel that will the communication between Flutter and native Android
-//  ///
-//  /// This local reference serves to register the plugin with the Flutter Engine and unregister it
-//  /// when the Flutter Engine is detached from the Activity
-//  private MethodChannel channel;
-//
-//  @Override
-//  public void onAttachedToEngine(@NonNull FlutterPluginBinding flutterPluginBinding) {
-//    channel = new MethodChannel(flutterPluginBinding.getBinaryMessenger(), "twilio_voice_flutter");
-//    channel.setMethodCallHandler(this);
-//  }
-//
-//  @Override
-//  public void onMethodCall(@NonNull MethodCall call, @NonNull Result result) {
-//    if (call.method.equals("getPlatformVersion")) {
-//      result.success("Android " + android.os.Build.VERSION.RELEASE);
-//    } else {
-//      result.notImplemented();
-//    }
-//  }
-//
-//  @Override
-//  public void onDetachedFromEngine(@NonNull FlutterPluginBinding binding) {
-//    channel.setMethodCallHandler(null);
-//  }
-//}
-
 package com.twilio.voice.flutter;
 
 import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
+import android.media.AudioManager;
 import android.os.Build;
+import androidx.annotation.RequiresApi;
+
+import android.os.Handler;
+import android.os.Looper;
 import android.util.Log;
 
 import androidx.annotation.NonNull;
@@ -51,448 +17,438 @@ import androidx.annotation.NonNull;
 import com.twilio.voice.Call;
 import com.twilio.voice.CallException;
 import com.twilio.voice.CallInvite;
-
-import java.util.Map;
-import java.util.Set;
-
-import com.twilio.voice.flutter.Utils.AppForegroundStateUtils;
+import com.twilio.voice.ConnectOptions;
+import com.twilio.voice.RegistrationException;
+import com.twilio.voice.RegistrationListener;
+import com.twilio.voice.UnregistrationListener;
+import com.twilio.voice.Voice;
 import com.twilio.voice.flutter.Utils.PreferencesUtils;
-import com.twilio.voice.flutter.Utils.TwilioConstants;
-import com.twilio.voice.flutter.Utils.TwilioRegistrationListener;
-import com.twilio.voice.flutter.Utils.TwilioUtils;
+
+import java.util.HashMap;
+import java.util.Locale;
+import java.util.Map;
+import java.util.Objects;
+
 import io.flutter.embedding.engine.plugins.FlutterPlugin;
-import io.flutter.embedding.engine.plugins.activity.ActivityAware;
 import io.flutter.embedding.engine.plugins.activity.ActivityPluginBinding;
-import io.flutter.plugin.common.BinaryMessenger;
 import io.flutter.plugin.common.MethodCall;
 import io.flutter.plugin.common.MethodChannel;
+import io.flutter.plugin.common.MethodChannel.MethodCallHandler;
 import io.flutter.plugin.common.MethodChannel.Result;
-import io.flutter.plugin.common.PluginRegistry;
+import io.flutter.plugin.common.EventChannel;
+import io.flutter.embedding.engine.plugins.activity.ActivityAware;
+import io.flutter.plugin.common.PluginRegistry.NewIntentListener;
+import java.util.List;
+import java.util.concurrent.CopyOnWriteArrayList;
 
-public class TwilioVoiceFlutterPlugin implements
-        FlutterPlugin,
-        MethodChannel.MethodCallHandler,
-        ActivityAware,
-        PluginRegistry.NewIntentListener {
-
+public class TwilioVoiceFlutterPlugin
+    implements FlutterPlugin, MethodCallHandler, EventChannel.StreamHandler, ActivityAware, NewIntentListener {
   private static final String TAG = "TwilioVoiceFlutter";
+  public static final String ACTION_CALL_EVENT = "ACTION_CALL_EVENT";
+  private static final String METHOD_CHANNEL_NAME = "twilio_voice_flutter";
+  private static final String EVENT_CHANNEL_NAME = "twilio_voice_flutter_events";
 
+  private MethodChannel methodChannel;
+  private EventChannel eventChannel;
+  private static EventChannel.EventSink eventSink;
   private Context context;
-  private MethodChannel responseChannel;
-  private CustomBroadcastReceiver broadcastReceiver;
-  private boolean broadcastReceiverRegistered = false;
+  private PreferencesUtils preferencesUtils;
+  private BroadcastReceiver callEventReceiver;
 
-  public TwilioVoiceFlutterPlugin() {
-  }
+  private final List<Map<String, Object>> pendingEvents = new CopyOnWriteArrayList<>();
 
-  private void setupMethodChannel(BinaryMessenger messenger, Context context) {
-    this.context = context;
-    MethodChannel channel = new MethodChannel(messenger, "twilio_voice_flutter");
-    channel.setMethodCallHandler(this);
-    this.responseChannel = new MethodChannel(messenger, "twilio_voice_flutter_response");
-  }
+  private static Call activeCall;
+  private static String status;
+  public static CallInvite activeCallInvite;
+  private RegistrationListener registrationListener;
+  public static Call.Listener callListener;
 
-  private void registerReceiver() {
-    if (!this.broadcastReceiverRegistered) {
-      this.broadcastReceiverRegistered = true;
+  @RequiresApi(api = Build.VERSION_CODES.TIRAMISU)
+  @Override
+  public void onAttachedToEngine(@NonNull FlutterPlugin.FlutterPluginBinding flutterPluginBinding) {
+    Log.d(TAG, "onAttachedToEngine");
+    context = flutterPluginBinding.getApplicationContext();
+    preferencesUtils = new PreferencesUtils(context);
+    methodChannel = new MethodChannel(flutterPluginBinding.getBinaryMessenger(), METHOD_CHANNEL_NAME);
+    methodChannel.setMethodCallHandler(this);
 
-      Log.i(TAG, "Registered broadcast");
-      this.broadcastReceiver = new CustomBroadcastReceiver(this);
-      IntentFilter intentFilter = new IntentFilter();
-      intentFilter.addAction(TwilioConstants.ACTION_ACCEPT);
-      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-          this.context.registerReceiver(this.broadcastReceiver, intentFilter, Context.RECEIVER_NOT_EXPORTED);
+    eventChannel = new EventChannel(flutterPluginBinding.getBinaryMessenger(), EVENT_CHANNEL_NAME);
+    eventChannel.setStreamHandler(this);
+
+    registrationListener = createRegistrationListener();
+    callListener = createCallListener();
+
+    callEventReceiver = new BroadcastReceiver() {
+      @Override
+      public void onReceive(Context context, Intent intent) {
+        if (Objects.equals(intent.getAction(), ACTION_CALL_EVENT)) {
+          String eventName = intent.getStringExtra("eventName");
+          String eventData = intent.getStringExtra("eventData");
+          sendEvent(eventName, eventData);
         }
       }
+    };
+
+    IntentFilter intentFilter = new IntentFilter(ACTION_CALL_EVENT);
+    context.registerReceiver(callEventReceiver, intentFilter, Context.RECEIVER_NOT_EXPORTED);
+  }
+
+  @Override
+  public void onMethodCall(@NonNull MethodCall call, @NonNull Result result) {
+    switch (call.method) {
+      case "register":
+        String identity = call.argument("identity");
+        String accessToken = call.argument("accessToken");
+        String fcmToken = call.argument("fcmToken");
+        register(identity, accessToken, fcmToken, result);
+        break;
+      case "unregister":
+        unregister();
+        break;
+      case "makeCall":
+        String to = call.argument("to");
+        makeCall(to, result);
+        break;
+      case "hangUp":
+        hangup(result);
+        break;
+      case "toggleMute":
+        toggleMute(result);
+        break;
+      case "isMuted":
+        isMuted(result);
+        break;
+      case "isSpeaker":
+        isOnSpeaker(result);
+        break;
+      case "toggleSpeaker":
+        toggleSpeaker(result);
+        break;
+      case "sendDigits":
+        String digits = call.argument("digits");
+        sendDigits(digits, result);
+        break;
+      case "getAccessToken":
+        getAccessToken(result);
+        break;
+      case "getFcmToken":
+        getFcmToken(result);
+        break;
+      default:
+        result.notImplemented();
     }
   }
 
-  private void unregisterReceiver() {
-    if (this.broadcastReceiverRegistered) {
-      this.broadcastReceiverRegistered = false;
+  private void register(String identity, String accessToken, String fcmToken, Result result) {
+    preferencesUtils.setAccessToken(accessToken);
+    preferencesUtils.setFcmToken(fcmToken);
+    Voice.register(accessToken, Voice.RegistrationChannel.FCM, fcmToken, registrationListener);
+    result.success("Registering with identity: " + identity);
+  }
 
-      Log.i(TAG, "Unregistered broadcast");
-      this.context.unregisterReceiver(this.broadcastReceiver);
-//            LocalBroadcastManager.getInstance(this.context).unregisterReceiver(this.broadcastReceiver);
+  public void unregister() {
+    String accessToken = preferencesUtils.getAccessToken();
+    if (accessToken == null)
+      return;
+
+    String fcmToken = preferencesUtils.getFcmToken();
+    if (fcmToken == null)
+      return;
+
+    preferencesUtils.clearTokens();
+    Voice.unregister(accessToken, Voice.RegistrationChannel.FCM, fcmToken, new UnregistrationListener() {
+      @Override
+      public void onUnregistered(String s, String s1) {
+        Log.d(TAG, "Successfully unregistered");
+      }
+
+      @Override
+      public void onError(RegistrationException error, String accessToken, String fcmToken) {
+        String message = String.format(
+            Locale.US,
+            "Registration Error: %d, %s",
+            error.getErrorCode(),
+            error.getMessage());
+
+        Log.d(TAG, "Error unregistering. " + message);
+      }
+    });
+  }
+
+  private void makeCall(String to, Result result) {
+    String accessToken = preferencesUtils.getAccessToken();
+    if (accessToken == null) {
+      result.error("NO_ACCESS_TOKEN", "No access token available", null);
+      return;
+    }
+
+    sendEvent("callConnecting", "");
+
+    Map<String, String> params = new HashMap<>();
+    params.put("to", to);
+    ConnectOptions connectOptions = new ConnectOptions.Builder(accessToken)
+        .params(params)
+        .build();
+    activeCall = Voice.connect(context, connectOptions, callListener);
+    result.success("Calling " + to);
+  }
+
+  private void hangup(Result result) {
+    if (activeCall != null) {
+      activeCall.disconnect();
+      activeCall = null;
+      result.success("Call disconnected");
+    }
+    // else {
+    // result.error("NO_ACTIVE_CALL", "No active call to hangup", null);
+    // }
+  }
+
+  private void getFcmToken(Result result) {
+    String fcmToken = preferencesUtils.getFcmToken();
+    if (fcmToken != null) {
+      result.success(fcmToken);
+    } else {
+      result.error("NO_FCM_TOKEN", "No FCM token available", null);
     }
   }
 
+  private void getAccessToken(Result result) {
+    String accessToken = preferencesUtils.getAccessToken();
+    if (accessToken != null) {
+      result.success(accessToken);
+    } else {
+      result.error("NO_ACCESS_TOKEN", "No access token available", null);
+    }
+  }
+
+  private void toggleMute(Result result) {
+    if (activeCall != null) {
+      boolean mute = !activeCall.isMuted();
+      activeCall.mute(mute);
+      result.success(true);
+    } else {
+      result.success(false);
+    }
+  }
+
+  private void isMuted(Result result) {
+    if (activeCall != null) {
+      result.success(activeCall.isMuted());
+    }
+    result.success(false);
+
+  }
+
+  private void isOnSpeaker(Result result) {
+    AudioManager audioManager = (AudioManager) context.getSystemService(Context.AUDIO_SERVICE);
+    result.success(audioManager.isSpeakerphoneOn());
+  }
+
+  private void toggleSpeaker(Result result) {
+    AudioManager audioManager = (AudioManager) context.getSystemService(Context.AUDIO_SERVICE);
+    boolean speakerOn = !audioManager.isSpeakerphoneOn();
+    audioManager.setSpeakerphoneOn(speakerOn);
+    result.success(speakerOn);
+  }
+
+  private void sendDigits(String digits, Result result) {
+    if (activeCall != null && digits != null) {
+      activeCall.sendDigits(digits);
+      result.success("Digits sent: " + digits);
+    } else {
+      result.error("SEND_DIGITS_ERROR", "No active call or invalid digits", null);
+    }
+  }
+
+  private RegistrationListener createRegistrationListener() {
+    return new RegistrationListener() {
+      @Override
+      public void onRegistered(@NonNull String accessToken, @NonNull String fcmToken) {
+        Log.d(TAG, "Successfully registered FCM " + fcmToken);
+      }
+
+      @Override
+      public void onError(@NonNull RegistrationException error,
+          @NonNull String accessToken,
+          @NonNull String fcmToken) {
+        String message = String.format(
+            Locale.US,
+            "Registration Error: %d, %s",
+            error.getErrorCode(),
+            error.getMessage());
+        Log.e(TAG, message);
+
+      }
+    };
+  }
+
+  private Call.Listener createCallListener() {
+    return new Call.Listener() {
+
+      @Override
+      public void onRinging(@NonNull Call call) {
+        Log.d(TAG, "Ringing");
+        sendEvent("callRinging", "");
+        status = "callRinging";
+      }
+
+      @Override
+      public void onConnectFailure(@NonNull Call call, @NonNull CallException error) {
+        String message = String.format(
+            Locale.US,
+            "Call Error: %d, %s",
+            error.getErrorCode(),
+            error.getMessage());
+        Log.e(TAG, message);
+        status = "callFailure";
+        sendEvent("callFailure", message);
+      }
+
+      @Override
+      public void onConnected(@NonNull Call call) {
+        Log.d(TAG, "Connected");
+        activeCall = call;
+        status = "callConnected";
+        sendEvent("callConnected", "");
+      }
+
+      @Override
+      public void onReconnecting(@NonNull Call call, @NonNull CallException callException) {
+        Log.d(TAG, "Reconnecting");
+        status = "callReconnecting";
+        sendEvent("callReconnecting", "");
+      }
+
+      @Override
+      public void onReconnected(@NonNull Call call) {
+        Log.d(TAG, "Reconnected");
+        status = "callReconnected";
+        sendEvent("callReconnected", "");
+      }
+
+      @Override
+      public void onDisconnected(@NonNull Call call, CallException error) {
+        Log.d(TAG, "Disconnected");
+        if (error != null) {
+          String message = String.format(
+              Locale.US,
+              "Call Error: %d, %s",
+              error.getErrorCode(),
+              error.getMessage());
+          sendEvent("callDisconnected", message);
+        } else {
+          sendEvent("callDisconnected", "");
+        }
+        status = "callDisconnected";
+        activeCall = null;
+      }
+    };
+  }
+
+  public HashMap<String, Object> getCallDetails() {
+    HashMap<String, Object> map = new HashMap<>();
+
+    if (activeCall == null) {
+      map.put("id", "");
+      map.put("mute", false);
+      map.put("speaker", false);
+    } else {
+      AudioManager audioManager = (AudioManager) this.context.getSystemService(Context.AUDIO_SERVICE);
+      map.put("id", activeCall.getSid());
+      map.put("mute", activeCall.isMuted());
+      map.put("speaker", audioManager.isSpeakerphoneOn());
+    }
+
+    if (activeCallInvite != null) {
+      map.put("customParameters", activeCallInvite.getCustomParameters());
+    }
+
+    if (activeCallInvite != null) {
+      map.put("fromDisplayName", activeCallInvite.getFrom());
+      map.put("toDisplayName", activeCallInvite.getTo());
+    }
+
+    map.put("outgoing", activeCallInvite == null);
+    map.put("status", status);
+    return map;
+  }
+
+  private void sendEvent(String eventName, String eventData) {
+    Log.d(TAG, "event sink is null? " + (eventSink == null));
+    Log.d(TAG, "Sending event: " + eventName + " with data: " + eventData);
+    Map<String, Object> event = new HashMap<>();
+    event.put("event", eventName);
+    event.put("data", getCallDetails());
+    if (eventSink != null) {
+      eventSink.success(event);
+    } else {
+      pendingEvents.add(event);
+    }
+    Log.d(TAG, "Attempting to send event: " + eventName + " with data: " + eventData);
+  }
 
   @Override
   public void onAttachedToActivity(ActivityPluginBinding activityPluginBinding) {
     Log.d(TAG, "onAttachedToActivity");
     activityPluginBinding.addOnNewIntentListener(this);
-    this.registerReceiver();
+    this.registrationListener = createRegistrationListener();
   }
 
   @Override
   public void onDetachedFromActivityForConfigChanges() {
     Log.d(TAG, "onDetachedFromActivityForConfigChanges");
-    this.unregisterReceiver();
+    this.unregister();
   }
 
   @Override
   public void onReattachedToActivityForConfigChanges(ActivityPluginBinding activityPluginBinding) {
     Log.d(TAG, "onReattachedToActivityForConfigChanges");
     activityPluginBinding.addOnNewIntentListener(this);
-    this.registerReceiver();
+    this.registrationListener = createRegistrationListener();
   }
 
   @Override
   public void onDetachedFromActivity() {
     Log.d(TAG, "onDetachedFromActivity");
-    this.unregisterReceiver();
+    this.unregister();
   }
 
   @Override
-  public boolean onNewIntent(Intent intent) {
-    Log.d(TAG, "onNewIntent");
-    this.handleIncomingCallIntent(intent);
-    return false;
-  }
+  public void onListen(Object arguments, EventChannel.EventSink events) {
+    Log.d(TAG, "onListen called : " + events.toString());
+    eventSink = events;
 
-  private void handleIncomingCallIntent(Intent intent) {
-    if (intent != null && intent.getAction() != null) {
-      String action = intent.getAction();
-      Log.i(TAG, "onReceive. Action: " + action);
-
-      if (TwilioConstants.ACTION_ACCEPT.equals(action)) {
-        CallInvite callInvite = intent.getParcelableExtra(TwilioConstants.EXTRA_INCOMING_CALL_INVITE);
-        answer(callInvite);
-      }
+    // Send any pending events
+    if (!pendingEvents.isEmpty()) {
+      new Handler(Looper.getMainLooper()).post(() -> {
+        Log.d(TAG, "Sending pending events");
+        for (Map<String, Object> event : pendingEvents) {
+          eventSink.success(event);
+        }
+        pendingEvents.clear();
+      });
     }
   }
 
   @Override
-  public void onMethodCall(MethodCall call, @NonNull Result result) {
-    Log.i(TAG, "onMethodCall. Method: " + call.method);
-    TwilioUtils twilioUtils = TwilioUtils.getInstance(this.context);
-
-    switch (call.method) {
-      case "register": {
-        String identity = call.argument("identity");
-        String accessToken = call.argument("accessToken");
-        String fcmToken = call.argument("fcmToken");
-
-        try {
-          twilioUtils.register(identity, accessToken, fcmToken, new TwilioRegistrationListener() {
-            @Override
-            public void onRegistered() {
-              result.success("");
-            }
-
-            @Override
-            public void onError() {
-              result.error("CALL_TRANSACTION_FAILED", "Failed to register with Twilio", "An error occurred while setting up the registration.");
-            }
-          });
-        } catch (Exception exception) {
-          Log.e(TAG, "Exception occurred during register: ", exception);
-          result.error("TOKEN_EXPIRED", "Exception occurred during registration", exception.getMessage());
-        }
-      }
-      break;
-
-      case "unregister": {
-        try {
-          twilioUtils.unregister();
-          result.success("");
-        } catch (Exception exception) {
-          Log.e(TAG, "Exception occurred during unregister: ", exception);
-          result.error("UNREGISTER_ERROR", "Failed to unregister from Twilio Voice", exception.getMessage());
-        }
-      }
-      break;
-
-      case "makeCall": {
-        try {
-          String to = call.argument("to");
-          Map<String, Object> data = call.argument("data");
-          twilioUtils.makeCall(to, data, getCallListener());
-          responseChannel.invokeMethod("callConnecting", twilioUtils.getCallDetails());
-          result.success(twilioUtils.getCallDetails());
-        } catch (Exception exception) {
-          Log.e(TAG, "Exception occurred during makeCall: ", exception);
-          result.error("ACTIVE_CALL_EXISTS", "Failed to make a call", exception.getMessage());
-        }
-      }
-      break;
-
-      case "toggleMute": {
-        try {
-          boolean isMuted = twilioUtils.toggleMute();
-          responseChannel.invokeMethod(twilioUtils.getCallStatus(), twilioUtils.getCallDetails());
-          result.success(isMuted);
-        } catch (Exception exception) {
-          Log.e(TAG, "Exception occurred during toggleMute: ", exception);
-          result.error("NO_ACTIVE_CALL", "There is no active call.", exception.getMessage());
-        }
-      }
-      break;
-
-      case "isMuted": {
-        try {
-          boolean isMuted = twilioUtils.isMuted();
-          result.success(isMuted);
-        } catch (Exception exception) {
-          Log.e(TAG, "Exception occurred during isMuted: ", exception);
-          result.error("NO_ACTIVE_CALL", "There is no active call.", exception.getMessage());
-        }
-      }
-      break;
-
-      case "toggleSpeaker": {
-        try {
-          boolean isSpeaker = twilioUtils.toggleSpeaker();
-          responseChannel.invokeMethod(twilioUtils.getCallStatus(), twilioUtils.getCallDetails());
-          result.success(isSpeaker);
-        } catch (Exception exception) {
-          Log.e(TAG, "Exception occurred during toggleSpeaker: ", exception);
-          result.error("NO_ACTIVE_CALL", "There is no active call.", exception.getMessage());
-        }
-      }
-      break;
-
-      case "sendDigits": {
-        try {
-          String digits = call.argument("digits");
-          twilioUtils.sendDigits(digits);
-          result.success("");
-        } catch (Exception exception) {
-          Log.e(TAG, "Exception occurred during sendDigits: ", exception);
-          result.error("DIGITS_ERROR", "Failed to send digits", exception.getMessage());
-        }
-      }
-      break;
-
-      case "isSpeaker": {
-        try {
-          boolean isSpeaker = twilioUtils.isSpeaker();
-          result.success(isSpeaker);
-        } catch (Exception exception) {
-          Log.e(TAG, "Exception occurred during isSpeaker: ", exception);
-          result.error("NO_ACTIVE_CALL", "There is no active call.", exception.getMessage());
-        }
-      }
-      break;
-
-      case "hangUp": {
-        try {
-          twilioUtils.disconnect();
-          result.success("");
-        } catch (Exception exception) {
-          Log.e(TAG, "Exception occurred during hangUp: ", exception);
-          result.error("CALL_TRANSACTION_FAILED", "Failed to hang up the call", exception.getMessage());
-        }
-      }
-      break;
-
-      case "activeCall": {
-        if (twilioUtils.getActiveCall() == null) {
-          result.error("NO_ACTIVE_CALL", "There is no active call.", "Operation cannot be performed without an active call.");
-        } else {
-          result.success(twilioUtils.getCallDetails());
-        }
-      }
-      break;
-
-      case "setContactData": {
-        try {
-          Map<String, Object> data = call.argument("contacts");
-          String defaultDisplayName = call.argument("defaultDisplayName");
-          PreferencesUtils.getInstance(this.context).setContacts(data, defaultDisplayName);
-          result.success("");
-        } catch (Exception exception) {
-          Log.e(TAG, "Exception occurred during setContactData: ", exception);
-          result.error("CONTACT_DATA_ERROR", "Failed to set contact data", exception.getMessage());
-        }
-      }
-      break;
-
-      case "setCallStyle": {
-        try {
-          final PreferencesUtils preferencesUtils = PreferencesUtils.getInstance(this.context);
-
-          // Background color
-          if (call.argument("backgroundColor") != null) {
-            String color = call.argument("backgroundColor");
-            preferencesUtils.storeCallBackgroundColor(color);
-          } else {
-            preferencesUtils.clearCallBackgroundColor();
-          }
-
-          // Text Color
-          if (call.argument("textColor") != null) {
-            String color = call.argument("textColor");
-            preferencesUtils.storeCallTextColor(color);
-          } else {
-            preferencesUtils.clearCallTextColor();
-          }
-
-          // Button
-          if (call.argument("buttonColor") != null) {
-            String color = call.argument("buttonColor");
-            preferencesUtils.storeCallButtonColor(color);
-          } else {
-            preferencesUtils.clearCallButtonColor();
-          }
-
-          // Button Icon
-          if (call.argument("buttonIconColor") != null) {
-            String color = call.argument("buttonIconColor");
-            preferencesUtils.storeCallButtonIconColor(color);
-          } else {
-            preferencesUtils.clearCallButtonIconColor();
-          }
-
-          // Button focus
-          if (call.argument("buttonFocusColor") != null) {
-            String color = call.argument("buttonFocusColor");
-            preferencesUtils.storeCallButtonFocusColor(color);
-          } else {
-            preferencesUtils.clearCallButtonFocusColor();
-          }
-
-          // Button focus icon
-          if (call.argument("buttonFocusIconColor") != null) {
-            String color = call.argument("buttonFocusIconColor");
-            preferencesUtils.storeCallButtonFocusIconColor(color);
-          } else {
-            preferencesUtils.clearCallButtonFocusIconColor();
-          }
-
-          result.success("");
-        } catch (Exception exception) {
-          Log.e(TAG, "Exception occurred during setCallStyle: ", exception);
-
-          result.error("CALL_STYLE_ERROR", "Failed to set call style", exception.getMessage());
-        }
-      }
-      break;
-
-      case "resetCallStyle": {
-        try {
-          final PreferencesUtils preferencesUtils = PreferencesUtils.getInstance(this.context);
-          preferencesUtils.clearCallBackgroundColor();
-          preferencesUtils.clearCallTextColor();
-          preferencesUtils.clearCallButtonColor();
-          preferencesUtils.clearCallButtonIconColor();
-          preferencesUtils.clearCallButtonFocusColor();
-          preferencesUtils.clearCallButtonFocusIconColor();
-          result.success("");
-        } catch (Exception exception) {
-          Log.e(TAG, "Exception occurred during resetCallStyle: ", exception);
-          result.error("RESET_CALL_STYLE_ERROR", "Failed to reset call style", exception.getMessage());
-        }
-      }
-      break;
-
-      case "setForeground": {
-        try {
-          AppForegroundStateUtils.getInstance().setForeground(call.argument("foreground"));
-          result.success("");
-        } catch (Exception exception) {
-          Log.e(TAG, "Exception occurred during setForeground: ", exception);
-          result.error("FOREGROUND_ERROR", "Failed to set foreground state", exception.getMessage());
-        }
-      }
-      break;
-    }
-
-
-  }
-
-  @Override
-  public void onAttachedToEngine(FlutterPlugin.FlutterPluginBinding binding) {
-    setupMethodChannel(binding.getBinaryMessenger(), binding.getApplicationContext());
+  public void onCancel(Object arguments) {
+    Log.d(TAG, "onCancel called");
+    eventSink = null;
   }
 
   @Override
   public void onDetachedFromEngine(@NonNull FlutterPlugin.FlutterPluginBinding binding) {
-  }
-
-  private void answer(CallInvite callInvite) {
-    try {
-      TwilioUtils t = TwilioUtils.getInstance(this.context);
-      t.acceptInvite(callInvite, getCallListener());
-      responseChannel.invokeMethod("callConnecting", t.getCallDetails());
-    } catch (Exception exception) {
-      Log.e(TAG, "Exception occurred during answer: ", exception);
+    methodChannel.setMethodCallHandler(null);
+    // eventMethodChannel.setMethodCallHandler(null);
+    eventChannel.setStreamHandler(null);
+    if (callEventReceiver != null) {
+      context.unregisterReceiver(callEventReceiver);
     }
   }
 
-  Call.Listener getCallListener() {
-    TwilioUtils t = TwilioUtils.getInstance(this.context);
-
-    return new Call.Listener() {
-      @Override
-      public void onConnectFailure(@NonNull Call call, @NonNull CallException error) {
-        Log.d(TAG, "onConnectFailure. Error: " + error.getMessage());
-        responseChannel.invokeMethod("callDisconnected", "");
-      }
-
-      @Override
-      public void onRinging(@NonNull Call call) {
-        Log.d(TAG, "onRinging");
-        responseChannel.invokeMethod("callRinging", t.getCallDetails());
-      }
-
-      @Override
-      public void onConnected(@NonNull Call call) {
-        Log.d(TAG, "onConnected");
-        responseChannel.invokeMethod("callConnected", t.getCallDetails());
-      }
-
-      @Override
-      public void onReconnecting(@NonNull Call call, @NonNull CallException e) {
-        Log.d(TAG, "onReconnecting. Error: " + e.getMessage());
-        responseChannel.invokeMethod("callReconnecting", t.getCallDetails());
-      }
-
-      @Override
-      public void onReconnected(@NonNull Call call) {
-        Log.d(TAG, "onReconnected");
-        responseChannel.invokeMethod("callReconnected", t.getCallDetails());
-      }
-
-      @Override
-      public void onDisconnected(@NonNull Call call, CallException e) {
-        if (e != null) {
-          Log.d(TAG, "onDisconnected. Error: " + e.getMessage());
-        } else {
-          Log.d(TAG, "onDisconnected");
-        }
-        Log.d(TAG, call.getState().toString());
-        responseChannel.invokeMethod("callDisconnected", null);
-      }
-
-      @Override
-      public void onCallQualityWarningsChanged(
-              @NonNull Call call,
-              @NonNull Set<Call.CallQualityWarning> currentWarnings,
-              @NonNull Set<Call.CallQualityWarning> previousWarnings
-      ) {
-        Log.d(TAG, "onCallQualityWarningsChanged");
-      }
-    };
+  @Override
+  public boolean onNewIntent(Intent intent) {
+    return false;
   }
-
-  private static class CustomBroadcastReceiver extends BroadcastReceiver {
-
-    private final TwilioVoiceFlutterPlugin plugin;
-
-    private CustomBroadcastReceiver(TwilioVoiceFlutterPlugin plugin) {
-      this.plugin = plugin;
-    }
-
-    @Override
-    public void onReceive(Context context, Intent intent) {
-      plugin.handleIncomingCallIntent(intent);
-    }
-  }
-
-
 }
-
-

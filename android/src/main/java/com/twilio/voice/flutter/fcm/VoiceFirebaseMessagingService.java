@@ -18,74 +18,64 @@ import com.twilio.voice.Voice;
 import com.twilio.voice.flutter.IncomingCallNotificationService;
 import com.twilio.voice.flutter.Utils.TwilioConstants;
 
-
 public class VoiceFirebaseMessagingService extends FirebaseMessagingService {
 
-    public static final String ACTION_TOKEN = "io.flutter.plugins.firebase.messaging.TOKEN";
+    private static final String TAG = "VoiceFCMService";
+    public static final String ACTION_TOKEN = "com.twilio.voice.flutter.NEW_FCM_TOKEN";
     public static final String EXTRA_TOKEN = "token";
-
-    private static final String TAG = "FlutterFcmService";
 
     @Override
     public void onNewToken(@NonNull String token) {
-        Intent onMessageIntent = new Intent(ACTION_TOKEN);
-        onMessageIntent.putExtra(EXTRA_TOKEN, token);
-        LocalBroadcastManager.getInstance(getApplicationContext()).sendBroadcast(onMessageIntent);
+        Log.d(TAG, "Refreshed FCM token: " + token);
+        Intent tokenIntent = new Intent(ACTION_TOKEN);
+        tokenIntent.putExtra(EXTRA_TOKEN, token);
+        LocalBroadcastManager.getInstance(getApplicationContext()).sendBroadcast(tokenIntent);
     }
 
-    /**
-     * Called when message is received.
-     *
-     * @param remoteMessage Object representing the message received from Firebase Cloud Messaging.
-     */
     @Override
-    public void onMessageReceived(final RemoteMessage remoteMessage) {
-        Log.d(TAG, "Received onMessageReceived()");
-        Log.d(TAG, "Bundle data: " + remoteMessage.getData());
-        Log.d(TAG, "From: " + remoteMessage.getFrom());
-        // If application is running in the foreground use local broadcast to handle message.
-        // Otherwise use the background isolate to handle message.
+    public void onMessageReceived(@NonNull RemoteMessage remoteMessage) {
+        Log.d(TAG, "Received FCM message: " + remoteMessage.getData());
 
-        if (!remoteMessage.getData().isEmpty()) {
-            boolean valid = Voice.handleMessage(this, remoteMessage.getData(), new MessageListener() {
+        if (remoteMessage.getData().isEmpty()) {
+            Log.w(TAG, "Received empty data payload");
+            return;
+        }
+
+        try {
+            boolean validMessage = Voice.handleMessage(this, remoteMessage.getData(), new MessageListener() {
                 @Override
                 public void onCallInvite(@NonNull CallInvite callInvite) {
-                    handleInvite(callInvite);
+                    handleIncomingCall(callInvite);
                 }
 
                 @Override
-                public void onCancelledCallInvite(@NonNull CancelledCallInvite cancelledCallInvite, @Nullable CallException callException) {
-                    handleCanceledCallInvite(cancelledCallInvite);
+                public void onCancelledCallInvite(@NonNull CancelledCallInvite cancelledCallInvite,
+                        @Nullable CallException callException) {
+                    handleCancelledCall(cancelledCallInvite);
                 }
             });
 
-            if (!valid) {
-                Log.e(TAG, "The message was not a valid Twilio Voice SDK payload: " + remoteMessage.getData());
-                notificationReceived(remoteMessage);
+            if (!validMessage) {
+                Log.e(TAG, "Received invalid Twilio Voice payload");
             }
+        } catch (Exception e) {
+            Log.e(TAG, "Error handling FCM message", e);
         }
-
     }
 
-    // Override if you also receive notifications from other plugins
-    public void notificationReceived(final RemoteMessage remoteMessage) {
-    }
-
-    private void handleInvite(CallInvite callInvite) {
-        Intent intent = new Intent(this, IncomingCallNotificationService.class);
-        intent.setAction(TwilioConstants.ACTION_INCOMING_CALL);
-        intent.putExtra(TwilioConstants.EXTRA_INCOMING_CALL_INVITE, callInvite);
-
+    private void handleIncomingCall(@NonNull CallInvite callInvite) {
+        Log.d(TAG, "Received incoming call invite: " + callInvite.getCallSid());
+        Intent intent = new Intent(this, IncomingCallNotificationService.class)
+                .setAction(TwilioConstants.ACTION_INCOMING_CALL)
+                .putExtra(TwilioConstants.EXTRA_INCOMING_CALL_INVITE, callInvite);
         startService(intent);
     }
 
-    private void handleCanceledCallInvite(CancelledCallInvite cancelledCallInvite) {
-        Intent intent = new Intent(this, IncomingCallNotificationService.class);
-        intent.setAction(TwilioConstants.ACTION_CANCEL_CALL);
-        intent.putExtra(TwilioConstants.EXTRA_CANCELLED_CALL_INVITE, cancelledCallInvite);
+    private void handleCancelledCall(@NonNull CancelledCallInvite cancelledCallInvite) {
+        Log.d(TAG, "Received cancelled call invite: " + cancelledCallInvite.getCallSid());
+        Intent intent = new Intent(this, IncomingCallNotificationService.class)
+                .setAction(TwilioConstants.ACTION_CANCEL_CALL)
+                .putExtra(TwilioConstants.EXTRA_CANCELLED_CALL_INVITE, cancelledCallInvite);
         startService(intent);
     }
 }
-
-
-

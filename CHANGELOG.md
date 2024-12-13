@@ -1,3 +1,17 @@
+## 0.0.4
+
+✨ Added
+
+📞 Implemented call action handling for iOS
+
+🔄 Changed
+
+📦 Updated dependencies.
+
+🔧 Improved code utilization.
+
+🌊 Enhanced event stream for calls.
+
 ## 0.0.3
 
 * Improving documentation clarity and optimizing code for better performance and efficiency.
