@@ -134,10 +134,10 @@ With these features, the Twilio Voice Plugin provides a robust foundation for in
 
 ## Function Overview
 
-- **`registerTwilio()`**:
+- **`register()`**:
   Registers the device with Twilio using the access token and device token for VoIP push notifications.
 
-- **`unregisterTwilio()`**:
+- **`unregister()`**:
   Unregisters the device from Twilio VoIP push notifications, removing the access token and device token.
 
 - **`makeCall(String to)`**:
