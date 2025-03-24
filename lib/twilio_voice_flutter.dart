@@ -125,7 +125,7 @@ class TwilioVoiceFlutter {
   /// [data] is optional and can include additional information to send with the call; defaults to an empty map.
   static Future<TwilioVoiceFlutterCall> makeCall({
     required String to,
-    Map<String, dynamic> data = const <String, dynamic>{},
+    Map<String, String> data = const <String, String>{},
   }) async {
     final args = <String, Object>{
       "to": to.trim().replaceAll(" ", ""),
